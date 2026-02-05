@@ -1,0 +1,18 @@
+[project]
+name = "tsr"
+version = "0.1.0"
+description = "transcribe audio/video using whisper.cpp"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+tsr = "tsr.cli:main"
+
+[tool.uv]
+package = true
