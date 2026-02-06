@@ -48,7 +48,7 @@ This writes an `.srt` file by default next to the input.
 - Downloads `ggml-<size>.bin` into `~/.config/tsr/models`.
 
 `tsr model [size]`
-- Without `size`, shows a selectable model list in terminal and saves your selection as default.
+- Without `size`, opens an interactive model list (arrow keys + Enter) and saves your selection as default.
 - With `size`, updates default model in `~/.config/tsr/config.json`.
 
 `tsr run <input> [--output <path>] [--format srt|json] [--model <size>] [--plain]`

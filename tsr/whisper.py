@@ -1,6 +1,8 @@
 import json
+import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -34,6 +36,8 @@ class TranscriptionResult(BaseModel):
 AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm"})
 
+PROGRESS_PATTERN = re.compile(r"progress\s*=\s*(\d+)%")
+
 
 def extract_audio(video_path: Path, output_path: Path) -> None:
     subprocess.run(
@@ -57,10 +61,36 @@ def extract_audio(video_path: Path, output_path: Path) -> None:
     )
 
 
+def run_with_progress(
+    command: list[str], on_progress: Callable[[int], None]
+) -> None:
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        stderr = []
+        for line in process.stderr:
+            stderr.append(line)
+            match = PROGRESS_PATTERN.search(line)
+            if match:
+                on_progress(int(match.group(1)))
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(
+                return_code, command, stderr="".join(stderr)
+            )
+
+    on_progress(100)
+
+
 def transcribe(
     audio_path: str | Path,
     model_path: str | Path,
     whisper_bin: str | Path = "whisper-cli",
+    on_progress: Callable[[int], None] | None = None,
 ) -> TranscriptionResult:
     audio_path = Path(audio_path)
     model_path = Path(model_path)
@@ -75,21 +105,22 @@ def transcribe(
 
         output_base = tmpdir / "output"
 
-        subprocess.run(
-            [
-                str(whisper_bin),
-                "-m",
-                str(model_path),
-                "-f",
-                str(audio_path),
-                "-oj",
-                "-of",
-                str(output_base),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        cmd = [
+            str(whisper_bin),
+            "-m",
+            str(model_path),
+            "-f",
+            str(audio_path),
+            "-oj",
+            "-of",
+            str(output_base),
+            "-pp",
+        ]
+
+        if on_progress:
+            run_with_progress(cmd, on_progress)
+        else:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
 
         json_file = Path(f"{output_base}.json")
         data = json.loads(json_file.read_text(encoding="utf-8"))

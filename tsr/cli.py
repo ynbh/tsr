@@ -1,4 +1,10 @@
 import json
+import re
+import subprocess
+import sys
+import tempfile
+from contextlib import ExitStack
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
@@ -6,8 +12,18 @@ from typing import Annotated
 import httpx
 import typer
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.prompt import Prompt
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.widgets import Footer, OptionList, Static
 
 from tsr.whisper import (
     AUDIO_EXTENSIONS,
@@ -25,6 +41,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 HUGGINGFACE_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
+URL_PATTERN = re.compile(r"^https?://")
+
 
 class ModelSize(str, Enum):
     tiny = "tiny"
@@ -37,6 +55,46 @@ class ModelSize(str, Enum):
 class OutputFormat(str, Enum):
     json = "json"
     srt = "srt"
+
+
+class ModelPickerApp(App[ModelSize | None]):
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("escape", "quit", "Quit"),
+    ]
+
+    def __init__(self, current: ModelSize, downloaded: dict[ModelSize, bool]) -> None:
+        super().__init__()
+        self.current = current
+        self.downloaded = downloaded
+        self.models = list(ModelSize)
+
+    def compose(self) -> ComposeResult:
+        yield Static("Select default model (arrow keys + Enter)")
+        yield OptionList(*[self._label(model) for model in self.models], id="models")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        option_list = self.query_one(OptionList)
+        option_list.highlighted = self.models.index(self.current)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.exit(self.models[event.option_index])
+
+    def _label(self, model: ModelSize) -> str:
+        marker = "→" if model is self.current else " "
+        downloaded = "✓" if self.downloaded[model] else " "
+        return f"{marker} {downloaded} {model.value}"
+
+
+@dataclass(frozen=True)
+class InputSource:
+    path: Path
+    output_base: Path
+
+
+def is_url(value: str) -> bool:
+    return bool(URL_PATTERN.match(value))
 
 
 def get_model_url(size: ModelSize) -> str:
@@ -81,6 +139,91 @@ def result_to_plaintext(result: TranscriptionResult) -> str:
     return "\n".join(seg.text.strip() for seg in result.segments if seg.text.strip())
 
 
+def sanitize_stem(value: str) -> str:
+    stem = re.sub(r"[^\w\s-]", "", value).strip().replace(" ", "_")
+    return stem[:50] or "transcript"
+
+
+def get_downloaded_audio_path(directory: Path) -> Path:
+    audio_files = sorted(
+        path for path in directory.glob("audio.*") if path.suffix.lower() in AUDIO_EXTENSIONS
+    )
+    if not audio_files:
+        raise typer.BadParameter("yt-dlp did not produce a supported audio file")
+    return audio_files[0]
+
+
+def download_with_ytdlp(url: str, output_path: Path) -> str:
+    title_result = subprocess.run(
+        ["yt-dlp", "--print", "title", "--no-playlist", url],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    title = (
+        title_result.stdout.strip().split("\n")[0]
+        if title_result.stdout.strip()
+        else "audio"
+    )
+
+    subprocess.run(
+        [
+            "yt-dlp",
+            "--extract-audio",
+            "--audio-format",
+            "wav",
+            "--audio-quality",
+            "0",
+            "--no-playlist",
+            "-o",
+            str(output_path),
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    return title
+
+
+def resolve_local_input(path: Path) -> InputSource:
+    if not path.exists():
+        raise typer.BadParameter(f"file not found: {path}")
+    if not path.is_file():
+        raise typer.BadParameter(f"not a file: {path}")
+
+    input_type = detect_input_type(path)
+    console.print(f"[blue]detected {input_type}: {path.name}[/]")
+    return InputSource(path=path, output_base=path.with_suffix(""))
+
+
+def resolve_url_input(url: str, stack: ExitStack) -> InputSource:
+    console.print("[blue]downloading audio from URL...[/]")
+    temp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="tsr_")))
+    output_template = temp_dir / "audio.%(ext)s"
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        progress.add_task("fetching audio", total=None)
+        title = download_with_ytdlp(url, output_template)
+
+    audio_path = get_downloaded_audio_path(temp_dir)
+    input_type = detect_input_type(audio_path)
+    console.print(f"[green]downloaded:[/] {title}")
+    console.print(f"[blue]detected {input_type}: {audio_path.name}[/]")
+    return InputSource(path=audio_path, output_base=Path(sanitize_stem(title)))
+
+
+def resolve_input_source(value: str, stack: ExitStack) -> InputSource:
+    if is_url(value):
+        return resolve_url_input(value, stack)
+    return resolve_local_input(Path(value))
+
+
 def ensure_model_downloaded(size: ModelSize) -> Path:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_path = get_model_path(size)
@@ -110,6 +253,27 @@ def ensure_model_downloaded(size: ModelSize) -> Path:
     return model_path
 
 
+def pick_model_interactive(current: ModelSize) -> ModelSize:
+    downloaded = {model: get_model_path(model).exists() for model in ModelSize}
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        selected = ModelPickerApp(current, downloaded).run()
+        return selected or current
+
+    console.print("available models:")
+    for model in ModelSize:
+        marker = "→" if model is current else " "
+        mark_downloaded = "✓" if downloaded[model] else " "
+        console.print(f"  {marker} {mark_downloaded} {model.value}")
+    selected = Prompt.ask(
+        "\nselect model",
+        choices=[model.value for model in ModelSize],
+        default=current.value,
+        console=console,
+    )
+    return ModelSize(selected)
+
+
 @app.command()
 def download(
     size: Annotated[
@@ -133,23 +297,13 @@ def model(
     ] = None,
 ):
     config = load_config()
+    current = ModelSize(config.get("model", "base"))
 
     if size is None:
-        current = config.get("model", "base")
-        console.print("available models:")
-        for m in ModelSize:
-            marker = "→" if m.value == current else " "
-            downloaded = "✓" if get_model_path(m).exists() else " "
-            console.print(f"  {marker} {downloaded} {m.value}")
-        selected = Prompt.ask(
-            "\nselect model",
-            choices=[m.value for m in ModelSize],
-            default=current,
-            console=console,
-        )
-        config["model"] = selected
+        selected = pick_model_interactive(current)
+        config["model"] = selected.value
         save_config(config)
-        console.print(f"[green]default model set to {selected}[/]")
+        console.print(f"[green]default model set to {selected.value}[/]")
         return
 
     config["model"] = size.value
@@ -157,17 +311,34 @@ def model(
     console.print(f"[green]default model set to {size.value}[/]")
 
 
+def transcribe_with_progress(input_path: Path, model_path: Path) -> TranscriptionResult:
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("transcribing", total=100)
+
+        def on_progress(pct: int) -> None:
+            progress.update(task, completed=pct)
+
+        result = transcribe(input_path, model_path, on_progress=on_progress)
+        progress.update(task, completed=100)
+        return result
+
+
+def get_default_output_path(source: InputSource, output_format: OutputFormat) -> Path:
+    extension = ".json" if output_format is OutputFormat.json else ".srt"
+    return source.output_base.with_suffix(extension)
+
+
 @app.command()
 def run(
-    input_path: Annotated[
-        Path,
-        typer.Argument(
-            help="audio or video file to transcribe",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-        ),
+    input_source: Annotated[
+        str,
+        typer.Argument(help="audio/video file or URL to transcribe"),
     ],
     output: Annotated[
         Path | None,
@@ -189,37 +360,25 @@ def run(
         ),
     ] = False,
 ):
-    input_type = detect_input_type(input_path)
-    console.print(f"[blue]detected {input_type}: {input_path.name}[/]")
-
-    config = load_config()
-    size = model_size or ModelSize(config.get("model", "base"))
-    if not get_model_path(size).exists():
-        console.print(f"[yellow]model {size.value} not found, downloading now...[/]")
-    model_path = ensure_model_downloaded(size)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        progress.add_task("transcribing...", total=None)
-        result = transcribe(input_path, model_path)
+    with ExitStack() as stack:
+        source = resolve_input_source(input_source, stack)
+        config = load_config()
+        size = model_size or ModelSize(config.get("model", "base"))
+        if not get_model_path(size).exists():
+            console.print(f"[yellow]model {size.value} not found, downloading now...[/]")
+        model_path = ensure_model_downloaded(size)
+        result = transcribe_with_progress(source.path, model_path)
 
     if plain:
         console.print(result_to_plaintext(result), markup=False)
         return
 
-    if output is None:
-        ext = ".json" if format is OutputFormat.json else ".srt"
-        output = input_path.with_suffix(ext)
-
+    output_path = output or get_default_output_path(source, format)
     if format is OutputFormat.json:
-        output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
     else:
-        output.write_text(result_to_srt(result), encoding="utf-8")
-
-    console.print(f"[green]saved transcript to {output}[/]")
+        output_path.write_text(result_to_srt(result), encoding="utf-8")
+    console.print(f"[green]saved transcript to {output_path}[/]")
 
 
 def main():
