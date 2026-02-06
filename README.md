@@ -7,16 +7,28 @@ CLI tool to transcribe audio or video files using `whisper.cpp`.
 - Python `>=3.13`
 - `ffmpeg` available on `PATH` (required for video inputs)
 - `whisper-cli` available on `PATH` (from `whisper.cpp`)
+- `yt-dlp` available on `PATH` (optional, for URL transcription)
+
+On macOS:
+```bash
+brew install whisper-cpp ffmpeg yt-dlp
+```
 
 ## Install
 
+**Global install** (recommended):
 ```bash
-uv sync
+uv tool install git+https://github.com/ynbh/tsr.git
 ```
 
-Run with:
-
+Then use `tsr` directly:
 ```bash
+tsr --help
+```
+
+**Local development**:
+```bash
+uv sync
 uv run tsr --help
 ```
 
@@ -25,19 +37,19 @@ uv run tsr --help
 1. Download a model:
 
 ```bash
-uv run tsr download base
+tsr download base
 ```
 
 2. (Optional) Set default model:
 
 ```bash
-uv run tsr model base
+tsr model base
 ```
 
 3. Transcribe a file:
 
 ```bash
-uv run tsr run path/to/audio_or_video.mp4
+tsr run path/to/audio_or_video.mp4
 ```
 
 This writes an `.srt` file by default next to the input.
@@ -61,9 +73,43 @@ This writes an `.srt` file by default next to the input.
 
 - Audio: `.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`, `.opus`
 - Video: `.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`
+- URLs: Any site supported by yt-dlp (YouTube, Vimeo, etc.)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Input
+        URL[URL]
+        FILE[Local File]
+    end
+
+    subgraph Processing
+        URL --> YTDLP[yt-dlp]
+        YTDLP --> AUDIO[audio.wav]
+        FILE --> FFMPEG[ffmpeg]
+        FFMPEG --> AUDIO
+        AUDIO --> WHISPER[whisper-cli]
+    end
+
+    subgraph Output
+        WHISPER --> SRT[.srt]
+        WHISPER --> JSON[.json]
+        WHISPER --> PLAIN[plaintext]
+    end
+
+    subgraph Config
+        MODELS[(~/.config/tsr/models)]
+        CFG[(config.json)]
+    end
+
+    MODELS --> WHISPER
+    CFG --> WHISPER
+```
 
 ## Notes
 
 - Video files are converted to mono 16kHz WAV with `ffmpeg` before transcription.
+- URLs are downloaded as audio-only via `yt-dlp`.
 - Missing or invalid model files will cause command failure.
 - Subprocess failures from `ffmpeg` or `whisper-cli` are surfaced directly.
