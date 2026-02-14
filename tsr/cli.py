@@ -9,8 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
-import httpx
 import typer
+from faster_whisper import WhisperModel
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -32,14 +32,12 @@ from tsr.whisper import (
     transcribe,
 )
 
-app = typer.Typer(name="tsr", help="transcribe audio/video using whisper.cpp")
+app = typer.Typer(name="tsr", help="transcribe audio/video using faster-whisper")
 console = Console()
 
 CONFIG_DIR = Path.home() / ".config" / "tsr"
 MODELS_DIR = CONFIG_DIR / "models"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-
-HUGGINGFACE_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 URL_PATTERN = re.compile(r"^https?://")
 
@@ -84,7 +82,7 @@ class ModelPickerApp(App[ModelSize | None]):
     def _label(self, model: ModelSize) -> str:
         marker = "→" if model is self.current else " "
         downloaded = "✓" if self.downloaded[model] else " "
-        return f"{marker} {downloaded} {model.value}"
+        return f"{marker} {downloaded} {get_model_name(model)}"
 
 
 @dataclass(frozen=True)
@@ -97,12 +95,28 @@ def is_url(value: str) -> bool:
     return bool(URL_PATTERN.match(value))
 
 
-def get_model_url(size: ModelSize) -> str:
-    return f"{HUGGINGFACE_BASE}/ggml-{size.value}.bin"
+def get_model_name(size: ModelSize) -> str:
+    if size is ModelSize.large:
+        return "large-v3"
+    return size.value
 
 
-def get_model_path(size: ModelSize) -> Path:
-    return MODELS_DIR / f"ggml-{size.value}.bin"
+def parse_model_size(value: str | None) -> ModelSize:
+    if value == "large-v3":
+        return ModelSize.large
+    if value is None:
+        return ModelSize.base
+    try:
+        return ModelSize(value)
+    except ValueError:
+        return ModelSize.base
+
+
+def is_model_cached(size: ModelSize) -> bool:
+    if not MODELS_DIR.exists():
+        return False
+    token = f"faster-whisper-{get_model_name(size)}"
+    return any(MODELS_DIR.glob(f"**/*{token}*"))
 
 
 def load_config() -> dict:
@@ -146,7 +160,9 @@ def sanitize_stem(value: str) -> str:
 
 def get_downloaded_audio_path(directory: Path) -> Path:
     audio_files = sorted(
-        path for path in directory.glob("audio.*") if path.suffix.lower() in AUDIO_EXTENSIONS
+        path
+        for path in directory.glob("audio.*")
+        if path.suffix.lower() in AUDIO_EXTENSIONS
     )
     if not audio_files:
         raise typer.BadParameter("yt-dlp did not produce a supported audio file")
@@ -224,37 +240,37 @@ def resolve_input_source(value: str, stack: ExitStack) -> InputSource:
     return resolve_local_input(Path(value))
 
 
-def ensure_model_downloaded(size: ModelSize) -> Path:
+def ensure_model_cached(size: ModelSize) -> str:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = get_model_path(size)
+    model_name = get_model_name(size)
 
-    if model_path.exists():
-        return model_path
+    if is_model_cached(size):
+        console.print(f"[yellow]model {model_name} is already cached[/]")
+        return model_name
 
-    url = get_model_url(size)
-    console.print(f"[blue]downloading {size.value} model...[/]")
+    console.print(f"[blue]downloading {model_name} model...[/]")
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task = progress.add_task(f"downloading ggml-{size.value}.bin", total=None)
-
-        with httpx.stream("GET", url, follow_redirects=True) as response:
-            response.raise_for_status()
-            with open(model_path, "wb") as f:
-                for chunk in response.iter_bytes(chunk_size=8192):
-                    f.write(chunk)
+        task = progress.add_task(f"downloading {model_name}", total=None)
+        WhisperModel(
+            model_name,
+            device="auto",
+            compute_type="int8",
+            download_root=str(MODELS_DIR),
+        )
 
         progress.update(task, completed=True)
 
-    console.print(f"[green]saved to {model_path}[/]")
-    return model_path
+    console.print(f"[green]cached model {model_name}[/]")
+    return model_name
 
 
 def pick_model_interactive(current: ModelSize) -> ModelSize:
-    downloaded = {model: get_model_path(model).exists() for model in ModelSize}
+    downloaded = {model: is_model_cached(model) for model in ModelSize}
 
     if sys.stdin.isatty() and sys.stdout.isatty():
         selected = ModelPickerApp(current, downloaded).run()
@@ -264,7 +280,7 @@ def pick_model_interactive(current: ModelSize) -> ModelSize:
     for model in ModelSize:
         marker = "→" if model is current else " "
         mark_downloaded = "✓" if downloaded[model] else " "
-        console.print(f"  {marker} {mark_downloaded} {model.value}")
+        console.print(f"  {marker} {mark_downloaded} {get_model_name(model)}")
     selected = Prompt.ask(
         "\nselect model",
         choices=[model.value for model in ModelSize],
@@ -281,12 +297,7 @@ def download(
         typer.Argument(help="model size to download"),
     ] = ModelSize.base,
 ):
-    model_path = get_model_path(size)
-    if model_path.exists():
-        console.print(f"[yellow]model {size.value} already exists at {model_path}[/]")
-        return
-
-    ensure_model_downloaded(size)
+    ensure_model_cached(size)
 
 
 @app.command()
@@ -297,7 +308,7 @@ def model(
     ] = None,
 ):
     config = load_config()
-    current = ModelSize(config.get("model", "base"))
+    current = parse_model_size(config.get("model"))
 
     if size is None:
         selected = pick_model_interactive(current)
@@ -311,7 +322,7 @@ def model(
     console.print(f"[green]default model set to {size.value}[/]")
 
 
-def transcribe_with_progress(input_path: Path, model_path: Path) -> TranscriptionResult:
+def transcribe_with_progress(input_path: Path, model_name: str) -> TranscriptionResult:
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -324,7 +335,12 @@ def transcribe_with_progress(input_path: Path, model_path: Path) -> Transcriptio
         def on_progress(pct: int) -> None:
             progress.update(task, completed=pct)
 
-        result = transcribe(input_path, model_path, on_progress=on_progress)
+        result = transcribe(
+            input_path,
+            model_name=model_name,
+            model_cache_dir=MODELS_DIR,
+            on_progress=on_progress,
+        )
         progress.update(task, completed=100)
         return result
 
@@ -363,11 +379,14 @@ def run(
     with ExitStack() as stack:
         source = resolve_input_source(input_source, stack)
         config = load_config()
-        size = model_size or ModelSize(config.get("model", "base"))
-        if not get_model_path(size).exists():
-            console.print(f"[yellow]model {size.value} not found, downloading now...[/]")
-        model_path = ensure_model_downloaded(size)
-        result = transcribe_with_progress(source.path, model_path)
+        size = model_size or parse_model_size(config.get("model"))
+        if not is_model_cached(size):
+            resolved_name = get_model_name(size)
+            console.print(
+                f"[yellow]model {resolved_name} not in cache yet; "
+                "it will be downloaded on first run[/]"
+            )
+        result = transcribe_with_progress(source.path, get_model_name(size))
 
     if plain:
         console.print(result_to_plaintext(result), markup=False)

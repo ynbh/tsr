@@ -1,17 +1,16 @@
 # tsr
 
-CLI tool to transcribe audio or video files using `whisper.cpp`.
+CLI tool to transcribe audio or video files using `faster-whisper`.
 
 ## Requirements
 
 - Python `>=3.13`
 - `ffmpeg` available on `PATH` (required for video inputs)
-- `whisper-cli` available on `PATH` (from `whisper.cpp`)
 - `yt-dlp` available on `PATH` (optional, for URL transcription)
 
 On macOS:
 ```bash
-brew install whisper-cpp ffmpeg yt-dlp
+brew install ffmpeg yt-dlp
 ```
 
 ## Install
@@ -57,7 +56,8 @@ This writes an `.srt` file by default next to the input.
 ## Commands
 
 `tsr download [tiny|base|small|medium|large]`
-- Downloads `ggml-<size>.bin` into `~/.config/tsr/models`.
+- Prefetches and caches the mapped `faster-whisper` model into `~/.config/tsr/models`.
+- `large` maps to `large-v3`.
 
 `tsr model [size]`
 - Without `size`, opens an interactive model list (arrow keys + Enter) and saves your selection as default.
@@ -65,7 +65,7 @@ This writes an `.srt` file by default next to the input.
 
 `tsr run <input> [--output <path>] [--format srt|json] [--model <size>] [--plain]`
 - Transcribes supported audio/video input.
-- If the selected model is missing locally, it is downloaded automatically.
+- If the selected model is missing locally, it is downloaded automatically by `faster-whisper`.
 - If `--output` is omitted, output path is inferred from input extension.
 - `--plain` prints plaintext transcript to terminal and skips writing a file.
 
@@ -89,7 +89,7 @@ flowchart LR
         YTDLP --> AUDIO[audio.wav]
         FILE --> FFMPEG[ffmpeg]
         FFMPEG --> AUDIO
-        AUDIO --> WHISPER[whisper-cli]
+        AUDIO --> WHISPER[faster-whisper]
     end
 
     subgraph Output
@@ -99,7 +99,7 @@ flowchart LR
     end
 
     subgraph Config
-        MODELS[(~/.config/tsr/models)]
+        MODELS[(~/.config/tsr/models cache)]
         CFG[(config.json)]
     end
 
@@ -111,5 +111,5 @@ flowchart LR
 
 - Video files are converted to mono 16kHz WAV with `ffmpeg` before transcription.
 - URLs are downloaded as audio-only via `yt-dlp`.
-- Missing or invalid model files will cause command failure.
-- Subprocess failures from `ffmpeg` or `whisper-cli` are surfaced directly.
+- `faster-whisper` loads models by name and caches them under `~/.config/tsr/models`.
+- Subprocess failures from `ffmpeg` or `yt-dlp` are surfaced directly.
