@@ -7,10 +7,11 @@ CLI tool to transcribe audio or video files using `faster-whisper`.
 - Python `>=3.13`
 - `ffmpeg` available on `PATH` (required for video inputs)
 - `yt-dlp` available on `PATH` (optional, for URL transcription)
+- PortAudio runtime (required by `sounddevice` for `tsr watch`)
 
 On macOS:
 ```bash
-brew install ffmpeg yt-dlp
+brew install ffmpeg yt-dlp portaudio
 ```
 
 ## Install
@@ -69,6 +70,11 @@ This writes an `.srt` file by default next to the input.
 - If `--output` is omitted, output path is inferred from input extension.
 - `--plain` prints plaintext transcript to terminal and skips writing a file.
 
+`tsr watch [--wav-output <path>] [--output <path>] [--format srt|json] [--model <size>] [--chunk-seconds <n>] [--sample-rate <hz>] [--device <id|name>] [--plain/--no-plain]`
+- Records microphone audio with `sounddevice`.
+- Writes a `.wav` file as audio arrives.
+- Transcribes fixed chunks and rewrites the transcript file until you stop with `Ctrl+C`.
+
 ## Supported Input Types
 
 - Audio: `.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`, `.opus`
@@ -82,6 +88,7 @@ flowchart LR
     subgraph Input
         URL[URL]
         FILE[Local File]
+        MIC[Microphone]
     end
 
     subgraph Processing
@@ -89,6 +96,7 @@ flowchart LR
         YTDLP --> AUDIO[audio.wav]
         FILE --> FFMPEG[ffmpeg]
         FFMPEG --> AUDIO
+        MIC --> AUDIO
         AUDIO --> WHISPER[faster-whisper]
     end
 
@@ -111,5 +119,6 @@ flowchart LR
 
 - Video files are converted to mono 16kHz WAV with `ffmpeg` before transcription.
 - URLs are downloaded as audio-only via `yt-dlp`.
+- `watch` records mono PCM16 WAV and performs progressive chunk transcription.
 - `faster-whisper` loads models by name and caches them under `~/.config/tsr/models`.
 - Subprocess failures from `ffmpeg` or `yt-dlp` are surfaced directly.

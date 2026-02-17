@@ -58,33 +58,23 @@ def extract_audio(video_path: Path, output_path: Path) -> None:
     )
 
 
-def get_media_duration_seconds(path: Path) -> float | None:
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-    value = result.stdout.strip()
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
+def get_media_duration_seconds(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return float(result.stdout.strip())
 
 
 def format_timestamp(seconds: float) -> str:
@@ -95,10 +85,9 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 
-def transcribe(
+def transcribe_with_model(
     audio_path: str | Path,
-    model_name: str,
-    model_cache_dir: str | Path | None = None,
+    model: WhisperModel,
     on_progress: Callable[[int], None] | None = None,
 ) -> TranscriptionResult:
     source_path = Path(audio_path)
@@ -111,13 +100,6 @@ def transcribe(
             source_path = wav_path
 
         duration = get_media_duration_seconds(source_path)
-        model = WhisperModel(
-            model_name,
-            device="auto",
-            compute_type="int8",
-            download_root=str(model_cache_dir) if model_cache_dir else None,
-        )
-
         if on_progress:
             on_progress(1)
 
@@ -130,8 +112,6 @@ def transcribe(
             text = raw_segment.text.strip()
             start = float(raw_segment.start)
             end = float(raw_segment.end)
-            if end < start:
-                end = start
 
             from_offset = char_offset
             to_offset = from_offset + len(text)
@@ -150,7 +130,7 @@ def transcribe(
                 )
             )
 
-            if on_progress and duration and duration > 0:
+            if on_progress:
                 progress = int(min(99, max(1, (end / duration) * 100)))
                 if progress > last_progress:
                     on_progress(progress)
@@ -163,3 +143,18 @@ def transcribe(
         language=(info.language or "unknown"),
         segments=segments,
     )
+
+
+def transcribe(
+    audio_path: str | Path,
+    model_name: str,
+    model_cache_dir: str | Path | None = None,
+    on_progress: Callable[[int], None] | None = None,
+) -> TranscriptionResult:
+    model = WhisperModel(
+        model_name,
+        device="auto",
+        compute_type="int8",
+        download_root=str(model_cache_dir) if model_cache_dir else None,
+    )
+    return transcribe_with_model(audio_path, model=model, on_progress=on_progress)
